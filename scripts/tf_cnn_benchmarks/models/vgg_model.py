@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-
 """Vgg model configuration.
 
 Includes multiple models: vgg11, vgg16, vgg19, corresponding to
@@ -53,28 +52,28 @@ def _construct_vgg(cnn, num_conv_layers):
   cnn.dropout()
 
 
-class Vgg11Model(model.Model):
+class Vgg11Model(model.CNNModel):
 
-  def __init__(self):
-    super(Vgg11Model, self).__init__('vgg11', 224, 64, 0.005)
+  def __init__(self, params=None):
+    super(Vgg11Model, self).__init__('vgg11', 224, 64, 0.005, params=params)
 
   def add_inference(self, cnn):
     _construct_vgg(cnn, [1, 1, 2, 2, 2])
 
 
-class Vgg16Model(model.Model):
+class Vgg16Model(model.CNNModel):
 
-  def __init__(self):
-    super(Vgg16Model, self).__init__('vgg16', 224, 64, 0.005)
+  def __init__(self, params=None):
+    super(Vgg16Model, self).__init__('vgg16', 224, 64, 0.005, params=params)
 
   def add_inference(self, cnn):
     _construct_vgg(cnn, [2, 2, 3, 3, 3])
 
 
-class Vgg19Model(model.Model):
+class Vgg19Model(model.CNNModel):
 
-  def __init__(self):
-    super(Vgg19Model, self).__init__('vgg19', 224, 64, 0.005)
+  def __init__(self, params=None):
+    super(Vgg19Model, self).__init__('vgg19', 224, 64, 0.005, params=params)
 
   def add_inference(self, cnn):
     _construct_vgg(cnn, [2, 2, 4, 4, 4])

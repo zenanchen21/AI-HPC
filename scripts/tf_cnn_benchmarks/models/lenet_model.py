@@ -24,10 +24,11 @@ References:
 from models import model
 
 
-class Lenet5Model(model.Model):
+class Lenet5Model(model.CNNModel):
+  """Lenet5."""
 
-  def __init__(self):
-    super(Lenet5Model, self).__init__('lenet5', 28, 32, 0.005)
+  def __init__(self, params=None):
+    super(Lenet5Model, self).__init__('lenet5', 28, 32, 0.005, params=params)
 
   def add_inference(self, cnn):
     # Note: This matches TF's MNIST tutorial model

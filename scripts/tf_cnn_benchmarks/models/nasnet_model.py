@@ -485,8 +485,8 @@ def _build_nasnet_base(images,
           stride=2,
           prev_layer=cell_outputs[-2],
           cell_num=true_cell_num)
-      if add_and_check_endpoint('Reduction_Cell_{}'.format(
-          reduction_indices.index(cell_num)), net):
+      if add_and_check_endpoint(
+          'Reduction_Cell_{}'.format(reduction_indices.index(cell_num)), net):
         return net, end_points
       true_cell_num += 1
       cell_outputs.append(net)
@@ -532,11 +532,11 @@ def _build_nasnet_base(images,
   return logits, end_points
 
 
-class NasnetModel(model.Model):
+class NasnetModel(model.CNNModel):
   """Nasnet model configuration."""
 
-  def __init__(self):
-    super(NasnetModel, self).__init__('nasnet', 224, 32, 0.005)
+  def __init__(self, params=None):
+    super(NasnetModel, self).__init__('nasnet', 224, 32, 0.005, params=params)
 
   def add_inference(self, cnn):
     tf.logging.info('input_image_shape: {}'.format(cnn.top_layer.shape))
@@ -547,11 +547,12 @@ class NasnetModel(model.Model):
     cnn.top_size = cnn.top_layer.shape[-1].value
 
 
-class NasnetLargeModel(model.Model):
+class NasnetLargeModel(model.CNNModel):
   """Nasnet model configuration."""
 
-  def __init__(self):
-    super(NasnetLargeModel, self).__init__('nasnet', 331, 16, 0.005)
+  def __init__(self, params=None):
+    super(NasnetLargeModel, self).__init__(
+        'nasnet', 331, 16, 0.005, params=params)
 
   def add_inference(self, cnn):
     tf.logging.info('input_image_shape: {}'.format(cnn.top_layer.shape))
@@ -562,11 +563,12 @@ class NasnetLargeModel(model.Model):
     cnn.top_size = cnn.top_layer.shape[-1].value
 
 
-class NasnetCifarModel(model.Model):
+class NasnetCifarModel(model.CNNModel):
   """Nasnet cifar model configuration."""
 
-  def __init__(self):
-    super(NasnetCifarModel, self).__init__('nasnet', 32, 32, 0.025)
+  def __init__(self, params=None):
+    super(NasnetCifarModel, self).__init__(
+        'nasnet', 32, 32, 0.025, params=params)
 
   def add_inference(self, cnn):
     tf.logging.info('input_image_shape: {}'.format(cnn.top_layer.shape))

@@ -158,9 +158,8 @@ def mobilenet(input_tensor,
 @slim.add_arg_scope
 def mobilenet_base(input_tensor, depth_multiplier=1.0, **kwargs):
   """Creates base of the mobilenet (no pooling and no logits) ."""
-  return mobilenet(input_tensor,
-                   depth_multiplier=depth_multiplier,
-                   base_only=True, **kwargs)
+  return mobilenet(
+      input_tensor, depth_multiplier=depth_multiplier, base_only=True, **kwargs)
 
 
 def training_scope(**kwargs):
@@ -186,14 +185,14 @@ def training_scope(**kwargs):
   return lib.training_scope(**kwargs)
 
 
-class MobilenetModel(model.Model):
+class MobilenetModel(model.CNNModel):
   """Mobilenet model configuration."""
 
-  def __init__(self):
-    super(MobilenetModel, self).__init__('mobilenet', 224, 32, 0.005)
+  def __init__(self, params=None):
+    super(MobilenetModel, self).__init__(
+        'mobilenet', 224, 32, 0.005, params=params)
 
   def add_inference(self, cnn):
     with tf.contrib.slim.arg_scope(training_scope(is_training=cnn.phase_train)):
       cnn.top_layer, _ = mobilenet(cnn.top_layer, is_training=cnn.phase_train)
       cnn.top_size = cnn.top_layer.shape[-1].value
-

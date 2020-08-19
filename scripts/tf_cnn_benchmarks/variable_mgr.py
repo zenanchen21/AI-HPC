@@ -18,6 +18,9 @@
 
 from __future__ import print_function
 
+import contextlib
+import re
+
 import tensorflow as tf
 
 import allreduce
@@ -39,6 +42,8 @@ class VariableMgr(object):
 
     # A variable for automatic loss scaling.
     self.grad_has_inf_nan = None
+
+    self._reuse_vars = False
 
   def each_tower_has_variables(self):
     """Returns True if each GPU tower of the model has separate variables."""
@@ -140,6 +145,26 @@ class VariableMgr(object):
       params = tf.trainable_variables()
     return params
 
+  @contextlib.contextmanager
+  def reuse_variables(self):
+    """Context manager that causes variables requested to be reused.
+
+    Variables requested under this context manager must already exist, and will
+    be reused instead of being created again. This should be used if the
+    evaluation model is being built after the training model has already been
+    built. This is because the evaluation model should reuse variables from the
+    training model.
+
+    Yields:
+      Nothing.
+    """
+    old_reuse_vars = self._reuse_vars
+    try:
+      self._reuse_vars = True
+      yield
+    finally:
+      self._reuse_vars = old_reuse_vars
+
 
 class VariableMgrIndependent(VariableMgr):
   """VariableMgr that implements the --independent mode for local jobs.
@@ -153,7 +178,7 @@ class VariableMgrIndependent(VariableMgr):
     return True
 
   def create_outer_variable_scope(self, device_num):
-    return tf.variable_scope('v%s' % device_num,
+    return tf.variable_scope('v%s' % device_num, reuse=self._reuse_vars,
                              use_resource=self.use_resource_vars)
 
   def preprocess_device_grads(self, device_grads):
@@ -190,7 +215,7 @@ class VariableMgrLocalFetchFromPS(VariableMgr):
     return False
 
   def create_outer_variable_scope(self, device_num):
-    return tf.variable_scope('v', reuse=bool(device_num),
+    return tf.variable_scope('v', reuse=bool(device_num) or self._reuse_vars,
                              use_resource=self.use_resource_vars)
 
   def preprocess_device_grads(self, device_grads):
@@ -244,8 +269,8 @@ class VariableMgrLocalFetchFromStagedPS(VariableMgrLocalFetchFromPS):
     self._custom_getter = variable_mgr_util.StagedVariableGetter(
         device_num, self.benchmark_cnn.raw_devices, None, self)
     return tf.variable_scope(
-        'v', reuse=bool(device_num), custom_getter=self._custom_getter,
-        use_resource=self.use_resource_vars)
+        'v', reuse=bool(device_num) or self._reuse_vars,
+        custom_getter=self._custom_getter, use_resource=self.use_resource_vars)
 
   def trainable_variables_on_device(self,
                                     rel_device_num,
@@ -264,8 +289,9 @@ class VariableMgrLocalReplicated(VariableMgr):
      gradients to all towers.
   """
 
-  def __init__(self, benchmark_cnn, all_reduce_spec, agg_small_grads_max_bytes,
-               agg_small_grads_max_group):
+  def __init__(self, benchmark_cnn, all_reduce_spec,
+               agg_small_grads_max_bytes, agg_small_grads_max_group,
+               allreduce_merge_scope):
     super(VariableMgrLocalReplicated, self).__init__(benchmark_cnn)
     if all_reduce_spec:
       spec = allreduce.parse_all_reduce_spec(all_reduce_spec)
@@ -278,13 +304,14 @@ class VariableMgrLocalReplicated(VariableMgr):
     self._agg_small_grads_max_bytes = agg_small_grads_max_bytes
     self._agg_small_grads_max_group = agg_small_grads_max_group
     self._warmup_ops = []
+    self._allreduce_merge_scope = allreduce_merge_scope
     self._gradient_put_ops = None
 
   def each_tower_has_variables(self):
     return True
 
   def create_outer_variable_scope(self, device_num):
-    return tf.variable_scope('v%s' % device_num,
+    return tf.variable_scope('v%s' % device_num, reuse=self._reuse_vars,
                              use_resource=self.use_resource_vars)
 
   def preprocess_device_grads(self, device_grads):
@@ -296,17 +323,19 @@ class VariableMgrLocalReplicated(VariableMgr):
     algorithm = batch_allreduce.algorithm_from_params(self.benchmark_cnn.params)
     reduced_grads, self._warmup_ops = algorithm.batch_all_reduce(
         grads_to_reduce, self.benchmark_cnn.params.gradient_repacking,
-        compact_grads, defer_grads)
+        compact_grads, defer_grads, self.benchmark_cnn.params.xla_compile)
     if self.benchmark_cnn.enable_auto_loss_scale:
       # Check for infs or nans
       is_finite_list = []
-      for tower_grads in reduced_grads:
-        with tf.colocate_with(tower_grads[0]):
-          # TODO(tanmingxing): Create fused op that takes in a list of tensors
-          # as input and returns scalar boolean True if there are any infs/nans.
-          is_finite_list.append(tf.reduce_all(
-              [tf.reduce_all(tf.is_finite(g)) for g in tower_grads]))
-      self.grad_has_inf_nan = tf.logical_not(tf.reduce_all(is_finite_list))
+      with tf.name_scope('check_for_inf_and_nan'):
+        for tower_grads in reduced_grads:
+          with tf.colocate_with(tower_grads[0]):
+            # TODO(tanmingxing): Create fused op that takes in a list of tensors
+            # as input and returns scalar boolean True if there are any
+            # infs/nans.
+            is_finite_list.append(tf.reduce_all(
+                [tf.reduce_all(tf.is_finite(g)) for g in tower_grads]))
+        self.grad_has_inf_nan = tf.logical_not(tf.reduce_all(is_finite_list))
     reduced_device_grads = [[
         (g, v) for g, (_, v) in zip(grads, grad_vars)
     ] for grads, grad_vars in zip(reduced_grads, device_grads)]
@@ -353,8 +382,9 @@ class VariableMgrDistributedAllReduce(VariableMgr):
      and replicate the final value to all GPUs.
   """
 
-  def __init__(self, benchmark_cnn, all_reduce_spec, job_name, num_workers,
-               agg_small_grads_max_bytes, agg_small_grads_max_group):
+  def __init__(self, benchmark_cnn, all_reduce_spec, job_name,
+               num_workers, agg_small_grads_max_bytes,
+               agg_small_grads_max_group, allreduce_merge_scope):
     super(VariableMgrDistributedAllReduce, self).__init__(benchmark_cnn)
     if not all_reduce_spec:
       raise ValueError(
@@ -365,8 +395,10 @@ class VariableMgrDistributedAllReduce(VariableMgr):
     self._num_workers = num_workers
     self._agg_small_grads_max_bytes = agg_small_grads_max_bytes
     self._agg_small_grads_max_group = agg_small_grads_max_group
+    self._allreduce_merge_scope = allreduce_merge_scope
     if not self._all_reduce_spec:
       raise ValueError('all_reduce_spec must be specified')
+    self._single_session = True
 
   def each_tower_has_variables(self):
     return True
@@ -382,7 +414,7 @@ class VariableMgrDistributedAllReduce(VariableMgr):
     Returns:
       the requested variable_scope
     """
-    return tf.variable_scope('v%s' % device_num,
+    return tf.variable_scope('v%s' % device_num, reuse=self._reuse_vars,
                              use_resource=self.use_resource_vars)
 
   def preprocess_device_grads(self, device_grads):
@@ -397,6 +429,7 @@ class VariableMgrDistributedAllReduce(VariableMgr):
             spec_tuple.limit, remaining_grads)
       if this_grads:
         range_agg_grads = allreduce.sum_gradients_all_reduce(
+            self._single_session,
             self._all_reduce_device_prefixes,
             this_grads,
             self._num_workers,
@@ -404,7 +437,8 @@ class VariableMgrDistributedAllReduce(VariableMgr):
             spec_tuple.shards,
             self.benchmark_cnn.gpu_indices,
             agg_small_grads_max_bytes=self._agg_small_grads_max_bytes,
-            agg_small_grads_max_group=self._agg_small_grads_max_group)
+            agg_small_grads_max_group=self._agg_small_grads_max_group,
+            allreduce_merge_scope=self._allreduce_merge_scope)
         if not aggregated_grads:
           aggregated_grads = range_agg_grads
         else:
@@ -454,6 +488,149 @@ class VariableMgrDistributedAllReduce(VariableMgr):
     return self.benchmark_cnn.raw_devices
 
 
+# TODO(tucker): Merge this mode with DistributedAllReduce.
+class VariableMgrCollectiveAllReduce(VariableMgr):
+  """VariableMgr that implements the --collective_all_reduce mode.
+
+     Each GPU has its own copy of the variables. To apply gradients
+     the TF native collective all-reduce op is used to reduce the gradients
+     and replicate the final value to all GPUs.
+  """
+
+  def __init__(self, benchmark_cnn, all_reduce_spec,
+               num_workers, num_gpus, task_id, allreduce_merge_scope):
+    super(VariableMgrCollectiveAllReduce, self).__init__(benchmark_cnn)
+    if not all_reduce_spec:
+      raise ValueError(
+          'collective_all_reduce requires a non-empty all_reduce_spec: %s'
+          % all_reduce_spec)
+    parsed_spec = allreduce.parse_all_reduce_spec(all_reduce_spec)
+    # So far we only support a length-1 all_reduce_spec
+    if len(parsed_spec) > 1 or parsed_spec[0].limit > 0:
+      raise ValueError(
+          'collective_all_reduce requires one single-range all_reduce_spec %s'
+          % parsed_spec)
+    self._all_reduce_spec = parsed_spec[0]
+    if self._all_reduce_spec.alg != 'collective':
+      raise ValueError(
+          'VariableMgrCollectiveAllReduce initialized with non-collective '
+          'all_reduce_spec %s' % self.all_reduce_spec)
+    self._num_workers = num_workers
+    self._num_gpus = num_gpus
+    self._task_id = task_id
+    self._allreduce_merge_scope = allreduce_merge_scope
+    self._instance_key_counter = 10000
+    self._instance_key_table = dict()
+    self._single_session = False
+    # List of prefixes for generating PS devices, unused here.
+    self._all_reduce_device_prefixes = None
+
+  def each_tower_has_variables(self):
+    return True
+
+  def create_outer_variable_scope(self, device_num):
+    """Create a scope for the named device.
+
+    Args:
+      device_num: index of device for variable scope.
+
+    Returns:
+      the requested variable_scope
+    """
+    return tf.variable_scope('v%s' % device_num, reuse=self._reuse_vars)
+
+  def preprocess_device_grads(self, device_grads):
+    reduced_grads = allreduce.sum_gradients_all_reduce(
+        self._single_session,
+        self._all_reduce_device_prefixes,
+        device_grads,
+        self._num_workers,
+        'collective',
+        self._all_reduce_spec.shards,
+        self.benchmark_cnn.gpu_indices,
+        allreduce_merge_scope=self._allreduce_merge_scope)
+    assert len(reduced_grads) == len(device_grads)
+    full_device_set = []
+    for grads in device_grads:
+      g, _ = grads[0]
+      full_device_set.append(g.device)
+    return (full_device_set, reduced_grads)
+
+  def get_gradients_to_apply(self, device_num, gradient_state):
+    device_grads = gradient_state
+    if device_num >= len(device_grads):
+      raise ValueError('device_num %d exceeds length of device_grads (%d)' %
+                       (device_num, len(device_grads)))
+    return device_grads[device_num]
+
+  def _get_instance_key(self, name):
+    if name not in self._instance_key_table.keys():
+      self._instance_key_counter += 1
+      self._instance_key_table[name] = self._instance_key_counter
+    return self._instance_key_table[name]
+
+  def get_post_init_ops(self):
+    """Broadcast initialized values of variables to other devices.
+
+    Returns:
+      At task 0 device 0, broadcast_send.
+      At all other devices and tasks, broadcast_recv.
+    """
+    global_vars = tf.global_variables()
+    group_size = self._num_workers * self._num_gpus
+    post_init_ops = []
+    # Gather variables into same-var-different-device groups.
+    vars_by_suffix = dict()
+    for v in global_vars:
+      split_name = v.name.split('/')
+      mo = re.match(r'v(\d+)$', split_name[0])
+      if mo:
+        device_id = int(mo.group(1))
+        suffix = '/'.join(split_name[1:])
+        if suffix in vars_by_suffix.keys():
+          vars_by_suffix[suffix].append(v)
+        else:
+          vars_by_suffix[suffix] = [v]
+    # Generate broadcast ops for each such group.
+    for suffix in sorted(vars_by_suffix):
+      vlist = vars_by_suffix[suffix]
+      assert self._num_gpus == len(vlist)
+      devices = [v.device for v in vlist]
+      # NOTE: this key should generate the same value for all tasks
+      group_key = allreduce.collective_group_key(devices)
+      group_size = self._num_workers * len(devices)
+      instance_key = self._get_instance_key(suffix)
+      for v in vlist:
+        split_name = v.name.split('/')
+        mo = re.match(r'v(\d+)$', split_name[0])
+        if mo:
+          device_id = int(mo.group(1))
+          if (self._task_id == 0 and device_id == 0):
+            with tf.device(v.device):
+              bcast_send = allreduce.broadcast_send(
+                  v, v.shape, v.dtype, group_size, group_key, instance_key)
+              post_init_ops.append(v.assign(bcast_send))
+          else:
+            with tf.device(v.device):
+              bcast_recv = allreduce.broadcast_recv(
+                  v.shape, v.dtype, group_size, group_key, instance_key)
+              post_init_ops.append(v.assign(bcast_recv))
+    return post_init_ops
+
+  def savable_variables(self):
+    """Return the set of variables used for saving/loading the model."""
+    params = []
+    if self._task_id == 0:
+      for v in tf.global_variables():
+        split_name = v.name.split('/')
+        if split_name[0] == 'v0' or not v.name.startswith('v'):
+          params.append(v)
+    return params
+
+  def get_devices(self):
+    return self.benchmark_cnn.raw_devices
+
+
 class VariableMgrDistributedFetchFromPS(VariableMgr):
   """Implements --variable_update=parameter_server mode for distributed jobs.
 
@@ -473,8 +650,8 @@ class VariableMgrDistributedFetchFromPS(VariableMgr):
     custom_getter = variable_mgr_util.OverrideCachingDevice(
         caching_devices, self.benchmark_cnn.cpu_device, 1024 * 64)
     return tf.variable_scope(
-        'v', reuse=bool(device_num), custom_getter=custom_getter,
-        use_resource=self.use_resource_vars)
+        'v', reuse=bool(device_num) or self._reuse_vars,
+        custom_getter=custom_getter, use_resource=self.use_resource_vars)
 
   def preprocess_device_grads(self, device_grads):
     # Returns (gradient_devices, gradient_state)
@@ -516,8 +693,8 @@ class VariableMgrDistributedFetchFromStagedPS(
         device_num, self.benchmark_cnn.raw_devices,
         self.benchmark_cnn.cpu_device, self)
     return tf.variable_scope(
-        'v', reuse=bool(device_num), custom_getter=self._custom_getter,
-        use_resource=self.use_resource_vars)
+        'v', reuse=bool(device_num) or self._reuse_vars,
+        custom_getter=self._custom_getter, use_resource=self.use_resource_vars)
 
   def supports_staged_vars(self):
     return True
@@ -544,7 +721,7 @@ class VariableMgrDistributedReplicated(VariableMgr):
 
   def create_outer_variable_scope(self, device_num):
     return tf.variable_scope(
-        'v%s' % device_num,
+        'v%s' % device_num, reuse=self._reuse_vars,
         custom_getter=variable_mgr_util.OverrideToLocalVariableIfNotPsVar(),
         use_resource=self.use_resource_vars)
 
